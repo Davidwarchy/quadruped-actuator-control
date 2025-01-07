@@ -1,0 +1,393 @@
+#VRML_SIM R2023b utf8
+
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackground.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/backgrounds/protos/TexturedBackgroundLight.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/objects/floors/protos/RectangleArena.proto"
+EXTERNPROTO "https://raw.githubusercontent.com/cyberbotics/webots/R2023b/projects/appearances/protos/Parquetry.proto"
+
+WorldInfo {
+  info [
+    "Demonstration of alternate gait using linear and rotational motors."
+    "Quadruped Robot Implementation"
+  ]
+  title "Quadruped"
+  CFM 0.0001
+  ERP 0.6
+  basicTimeStep 8
+  contactProperties [
+    ContactProperties {
+      material2 "floor"
+      coulombFriction [
+        0.5
+      ]
+    }
+  ]
+}
+Viewpoint {
+  orientation -0.3698536869371681 -0.0866302964600653 0.925042400106192 3.668759044918113
+  position 1.0655355265618014 0.6133994905630977 0.9907903770328625
+  follow "quadruped"
+}
+TexturedBackground {
+}
+RectangleArena {
+  floorSize 10 10
+  floorTileSize 0.25 0.5
+  floorAppearance Parquetry {
+    type "light strip"
+  }
+  wallThickness 0.5
+  wallHeight 2
+}
+DEF QUADRUPED Robot {
+  translation 0.1 0 0.06
+  children [
+    DEF HIP_HINGE_JOINT_L0 HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 0 1
+        anchor 0.2 0.05 0
+        minStop -0.7
+        maxStop 0.7
+      }
+      device [
+        RotationalMotor {
+          name "hip_motor_l0"
+          maxVelocity 5
+          minPosition -0.7
+          maxPosition 0.7
+        }
+        PositionSensor {
+          name "hip_motor_l0_sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 0.20001451600657183 0.05002377133803874 1.5589330038562336e-05
+        rotation 0.6824106931183517 -0.7309689773139851 -1.1057922508107458e-05 1.3047428150700327e-05
+        children [
+          DEF HIP_SHAPE Shape {
+            appearance DEF HIP_APPEARANCE PBRAppearance {
+              baseColor 1 0 0
+              roughness 1
+              metalness 0
+            }
+            geometry Cylinder {
+              height 0.06
+              radius 0.02
+            }
+          }
+          DEF FEMUR_TRANS Pose {
+            translation 0 0.06 0
+            children [
+              DEF FEMUR_SHAPE Shape {
+                appearance DEF METAL_APPEARANCE PBRAppearance {
+                  baseColor 0.5 0.5 0.5
+                  roughness 1
+                  metalness 0
+                }
+                geometry Box {
+                  size 0.02 0.1 0.02
+                }
+              }
+            ]
+          }
+          DEF KNEE_TRANS Pose {
+            translation 0 0.11 0
+            children [
+              DEF KNEE_SHAPE Shape {
+                appearance DEF KNEE_APPEARANCE PBRAppearance {
+                  baseColor 0 0.6 0.2
+                  roughness 1
+                  metalness 0
+                }
+                geometry Cylinder {
+                  height 0.06
+                  radius 0.02
+                }
+              }
+            ]
+          }
+          DEF KNEE_SLIDER_JOINT_L0 SliderJoint {
+            jointParameters JointParameters {
+              axis 0 0 -1
+              minStop -0.02
+              maxStop 0.02
+            }
+            device [
+              LinearMotor {
+                name "knee_motor_l0"
+                maxVelocity 0.05
+                minPosition -0.02
+                maxPosition 0.02
+              }
+              PositionSensor {
+                name "knee_motor_l0_sensor"
+              }
+            ]
+            endPoint Solid {
+              translation 0 0.11 -0.03
+              rotation 1 0 0 1.5708
+              children [
+                DEF TIBIA_TRANS Pose {
+                  rotation 1 0 0 1.5708
+                  children [
+                    DEF TIBIA_SHAPE Shape {
+                      appearance USE METAL_APPEARANCE
+                      geometry Cylinder {
+                        height 0.06
+                        radius 0.01
+                      }
+                    }
+                  ]
+                }
+              ]
+              boundingObject USE TIBIA_TRANS
+              physics DEF STANDARD_PHYSICS Physics {
+              }
+            }
+          }
+        ]
+        name "l0"
+        boundingObject USE KNEE_TRANS
+        physics USE STANDARD_PHYSICS
+      }
+    }
+    DEF HIP_HINGE_JOINT_L1 HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 0 1
+        anchor 0 0.05 0
+        minStop -0.7
+        maxStop 0.7
+      }
+      device [
+        RotationalMotor {
+          name "hip_motor_l1"
+          maxVelocity 5
+          minPosition -0.7
+          maxPosition 0.7
+        }
+        PositionSensor {
+          name "hip_motor_l1_sensor"
+        }
+      ]
+      endPoint Solid {
+        translation -4.441809429081858e-07 0.05000574677909487 -1.7744109843120812e-06
+        rotation -0.9780509908866837 -0.2083656860742393 9.611841541155473e-06 1.1342436587306474e-05
+        children [
+          USE HIP_SHAPE
+          USE FEMUR_TRANS
+          USE KNEE_TRANS
+          DEF KNEE_SLIDER_JOINT_L1 SliderJoint {
+            jointParameters JointParameters {
+              axis 0 0 -1
+              minStop -0.02
+              maxStop 0.02
+            }
+            device [
+              LinearMotor {
+                name "knee_motor_l1"
+                maxVelocity 0.05
+                minPosition -0.02
+                maxPosition 0.02
+              }
+              PositionSensor {
+                name "knee_motor_l1_sensor"
+              }
+            ]
+            endPoint Solid {
+              translation 0 0.11 -0.03
+              rotation 1 0 0 1.5708
+              children [
+                USE TIBIA_TRANS
+              ]
+              boundingObject USE TIBIA_TRANS
+              physics USE STANDARD_PHYSICS
+            }
+          }
+        ]
+        name "l1"
+        boundingObject USE KNEE_TRANS
+        physics USE STANDARD_PHYSICS
+      }
+    }
+    DEF HIP_HINGE_JOINT_R0 HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 0 1
+        anchor 0.2 -0.05 0
+        minStop -0.7
+        maxStop 0.7
+      }
+      device [
+        RotationalMotor {
+          name "hip_motor_r0"
+          maxVelocity 5
+          minPosition -0.7
+          maxPosition 0.7
+        }
+        PositionSensor {
+          name "hip_motor_r0_sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 0.20000206743254365 -0.05002584740198416 -2.1488501714683746e-06
+        rotation 0.63820377674753 -0.7698674816182706 -9.588042476677236e-06 1.1313190824695246e-05
+        children [
+          USE HIP_SHAPE
+          DEF RIGHT_FEMUR_TRANS Pose {
+            translation 0 -0.06 0
+            children [
+              USE FEMUR_SHAPE
+            ]
+          }
+          DEF RIGHT_KNEE_TRANS Pose {
+            translation 0 -0.11 0
+            children [
+              USE KNEE_SHAPE
+            ]
+          }
+          DEF KNEE_SLIDER_JOINT_R0 SliderJoint {
+            jointParameters JointParameters {
+              axis 0 0 -1
+              minStop -0.02
+              maxStop 0.02
+            }
+            device [
+              LinearMotor {
+                name "knee_motor_r0"
+                maxVelocity 0.05
+                minPosition -0.02
+                maxPosition 0.02
+              }
+              PositionSensor {
+                name "knee_motor_r0_sensor"
+              }
+            ]
+            endPoint Solid {
+              translation 0 -0.11 -0.03
+              rotation 1 0 0 1.5708
+              children [
+                USE TIBIA_TRANS
+              ]
+              boundingObject USE TIBIA_TRANS
+              physics USE STANDARD_PHYSICS
+            }
+          }
+        ]
+        name "r0"
+        boundingObject USE RIGHT_KNEE_TRANS
+        physics USE STANDARD_PHYSICS
+      }
+    }
+    DEF HIP_HINGE_JOINT_R1 HingeJoint {
+      jointParameters HingeJointParameters {
+        axis 0 0 1
+        anchor 0 -0.05 0
+        minStop -0.7
+        maxStop 0.7
+      }
+      device [
+        RotationalMotor {
+          name "hip_motor_r1"
+          maxVelocity 5
+          minPosition -0.7
+          maxPosition 0.7
+        }
+        PositionSensor {
+          name "hip_motor_r1_sensor"
+        }
+      ]
+      endPoint Solid {
+        translation 3.3599276316306344e-06 -0.05001700169370286 1.522145415527865e-05
+        rotation -0.9839192362272171 -0.1786139312809055 1.1594375166258665e-05 1.3681830423475085e-05
+        children [
+          USE HIP_SHAPE
+          USE RIGHT_FEMUR_TRANS
+          USE RIGHT_KNEE_TRANS
+          DEF KNEE_SLIDER_JOINT_R1 SliderJoint {
+            jointParameters JointParameters {
+              axis 0 0 -1
+              minStop -0.02
+              maxStop 0.02
+            }
+            device [
+              LinearMotor {
+                name "knee_motor_r1"
+                maxVelocity 0.05
+                minPosition -0.02
+                maxPosition 0.02
+              }
+              PositionSensor {
+                name "knee_motor_r1_sensor"
+              }
+            ]
+            endPoint Solid {
+              translation 0 -0.11 -0.029999999999999995
+              rotation 1 0 0 1.5708
+              children [
+                USE TIBIA_TRANS
+              ]
+              boundingObject USE TIBIA_TRANS
+              physics USE STANDARD_PHYSICS
+            }
+          }
+        ]
+        name "r1"
+        boundingObject USE RIGHT_KNEE_TRANS
+        physics USE STANDARD_PHYSICS
+      }
+    }
+    DEF BODY Solid {
+      translation 0.1 0 0
+      children [
+        DEF BODY_SHAPE Shape {
+          appearance USE METAL_APPEARANCE
+          geometry Box {
+            size 0.32 0.1 0.05
+          }
+        }
+      ]
+    }
+    DistanceSensor {
+      translation 0.26 0 0.02
+      name "ds_0"
+      lookupTable [
+        0 1000 0
+        20 200 0
+      ]
+    }
+    InertialUnit {
+      translation 0.11 -3.70381e-07 0
+      rotation 0 0 1 -1.5707996938995747
+      name "imu"
+      description "i"
+    }
+    Solid {
+      translation 0.26 -0.02 0.01
+      children [
+        DEF eye Shape {
+          appearance PBRAppearance {
+            baseColor 1 0 0
+            roughness 1
+          }
+          geometry Box {
+            size 0.02 0.02 0.02
+          }
+        }
+      ]
+      name "eye_1"
+    }
+    Solid {
+      translation 0.26 0.02 0.01
+      children [
+        USE eye
+      ]
+      name "eye_2"
+    }
+  ]
+  name "quadruped"
+  boundingObject USE BODY_SHAPE
+  physics USE STANDARD_PHYSICS
+  controller "drive_robot"
+}
+TexturedBackgroundLight {
+  castShadows FALSE
+}
