@@ -1,5 +1,7 @@
 # Robot Control with Deep Q-Network
 
+![alt text](image.png)
+
 This project demonstrates a robot controlled by a Deep Q-Network (DQN) for learning locomotion with respect to a given sensor's readings. The code uses a simulated environment provided by Webots.
 
 ## Project Structure
