@@ -8,6 +8,10 @@ from robot_desc import Rob
 from datetime import datetime
 import os
 
+# Check for GPU availability
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
+
 class QNetwork(nn.Module):
     def __init__(self, state_size, actions_per_actuator, num_actuators):
         super(QNetwork, self).__init__()
@@ -28,6 +32,9 @@ class QNetwork(nn.Module):
         for layer in [self.fc1, self.fc2] + list(self.output_layers):
             nn.init.xavier_uniform_(layer.weight)
             nn.init.zeros_(layer.bias)
+        
+        # Move model to GPU if available
+        self.to(device)
         
     def forward(self, x):
         if torch.isnan(x).any():
@@ -78,8 +85,6 @@ class RobotDQNAgent:
         self.sensor_histories = {i: deque(maxlen=100) for i in range(num_sensors)}
         self.sensor_stats = {i: {'min': None, 'max': None, 'mean': None, 'std': None} 
                            for i in range(num_sensors)}
-        self.baseline_reading = None
-        self.potential_scale = 0.5
         
         # Initialize networks
         self.q_network = QNetwork(state_size, actions_per_actuator, self.num_actuators)
@@ -197,16 +202,13 @@ class RobotDQNAgent:
         """Choose an action using epsilon-greedy policy"""
         if random.random() < self.epsilon:
             # Random actions for each actuator
-            actions = [random.randrange(self.actions_per_actuator) 
-                      for _ in range(self.num_actuators)]
+            return [random.randrange(self.actions_per_actuator) 
+                   for _ in range(self.num_actuators)]
         else:
             with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0)
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
                 action_values = self.q_network(state_tensor)
-                # Select best action for each actuator
-                actions = torch.argmax(action_values.squeeze(), dim=1).tolist()
-        
-        return actions
+                return torch.argmax(action_values.squeeze(), dim=1).cpu().tolist()
     
     def remember(self, state, actions, reward, next_state):
         """Store experience with multiple actions"""
@@ -220,11 +222,11 @@ class RobotDQNAgent:
         minibatch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states = zip(*minibatch)
         
-        # Convert to tensors with validation
-        states = torch.FloatTensor(np.array(states))
-        actions = torch.LongTensor(np.array(actions))  # Shape: [batch_size, num_actuators]
-        rewards = torch.FloatTensor(rewards)
-        next_states = torch.FloatTensor(np.array(next_states))
+        # Convert to tensors and move to GPU
+        states = torch.FloatTensor(np.array(states)).to(device)
+        actions = torch.LongTensor(np.array(actions)).to(device)
+        rewards = torch.FloatTensor(rewards).to(device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(device)
         
         if torch.isnan(states).any() or torch.isnan(next_states).any():
             print("NaN detected in batch data!")
@@ -248,8 +250,6 @@ class RobotDQNAgent:
             
             if torch.isnan(loss):
                 print("NaN loss detected!")
-                print(f"States range: {states.min().item():.2f} to {states.max().item():.2f}")
-                print(f"Rewards range: {rewards.min().item():.2f} to {rewards.max().item():.2f}")
                 return
             
             # Optimize
@@ -397,12 +397,12 @@ def save_model(agent, output_dir, model_name="robot_dqn_model"):
     """
     # Ensure directory exists
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Construct the path where the model will be saved
     model_path = os.path.join(output_dir, f"{model_name}.pth")
-    
-    # Save the model state dictionary
+    # Move model to CPU before saving
+    agent.q_network.cpu()
     torch.save(agent.q_network.state_dict(), model_path)
+    # Move model back to original device
+    agent.q_network.to(device)
     print(f"Model saved to {model_path}")
 
 def train_robot(rob, active_sensor_idx=0, num_episodes=100, historical_window=5, target_sensor_weight=0.5, output_dir='output'):
