@@ -1,3 +1,4 @@
+# drive_robot.py
 import numpy as np
 import torch
 import torch.nn as nn
@@ -7,10 +8,6 @@ from collections import deque
 from robot_desc import Rob
 from datetime import datetime
 import os
-
-# Check for GPU availability
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-print(f"Using device: {device}")
 
 class QNetwork(nn.Module):
     def __init__(self, state_size, actions_per_actuator, num_actuators):
@@ -32,9 +29,6 @@ class QNetwork(nn.Module):
         for layer in [self.fc1, self.fc2] + list(self.output_layers):
             nn.init.xavier_uniform_(layer.weight)
             nn.init.zeros_(layer.bias)
-        
-        # Move model to GPU if available
-        self.to(device)
         
     def forward(self, x):
         if torch.isnan(x).any():
@@ -69,7 +63,7 @@ class RobotDQNAgent:
         self.gamma = 0.95  # Increased gamma to value future rewards more
         self.epsilon = 1.0
         self.epsilon_min = 0.01
-        self.epsilon_decay = 0.99999
+        self.epsilon_decay = 0.999999
         self.learning_rate = 0.001
         self.batch_size = 32
         self.max_grad_norm = 1.0
@@ -85,6 +79,8 @@ class RobotDQNAgent:
         self.sensor_histories = {i: deque(maxlen=100) for i in range(num_sensors)}
         self.sensor_stats = {i: {'min': None, 'max': None, 'mean': None, 'std': None} 
                            for i in range(num_sensors)}
+        self.baseline_reading = None
+        self.potential_scale = 0.5
         
         # Initialize networks
         self.q_network = QNetwork(state_size, actions_per_actuator, self.num_actuators)
@@ -119,26 +115,32 @@ class RobotDQNAgent:
             historical_diff = target_final - self.reading_history[-historical_window]
         else:
             historical_diff = target_final - target_initial
-        
+
         # Calculate stability penalty and normalize other sensors
         stability_penalty = 0
         normalized_others = {}
+        num_other_sensors = len(initial_readings) - 1  # Exclude the active sensor
+
         for i, (init_reading, final_reading) in enumerate(zip(initial_readings, final_readings)):
             if i != self.active_sensor_idx:
                 init_norm = self.normalize_reading(i, init_reading)
                 final_norm = self.normalize_reading(i, final_reading)
                 normalized_others[i] = final_norm
                 stability_penalty += abs(final_norm - init_norm)
+ 
+        # Average the stability penalty per sensor
+        if num_other_sensors > 0:
+            stability_penalty /= num_other_sensors
         
         # Calculate final reward
         sensor_weight = self.target_sensor_weight
-        stability_weight = 1 - target_sensor_weight
+        stability_weight = 1 - self.target_sensor_weight
         reward = (sensor_weight * historical_diff - 
                 stability_weight * stability_penalty)
-        
+
         # Update history
         self.reading_history.append(target_final)
-        
+    
         # Return reward and metrics
         metrics_data = {
             'normalized_target': target_final,
@@ -146,7 +148,7 @@ class RobotDQNAgent:
             'stability_penalty': stability_penalty,
             'normalized_others': normalized_others
         }
-        
+
         return np.clip(reward, -10, 10), metrics_data
 
     def update_sensor_stats(self, sensor_idx, reading):
@@ -202,13 +204,16 @@ class RobotDQNAgent:
         """Choose an action using epsilon-greedy policy"""
         if random.random() < self.epsilon:
             # Random actions for each actuator
-            return [random.randrange(self.actions_per_actuator) 
-                   for _ in range(self.num_actuators)]
+            actions = [random.randrange(self.actions_per_actuator) 
+                      for _ in range(self.num_actuators)]
         else:
             with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                state_tensor = torch.FloatTensor(state).unsqueeze(0)
                 action_values = self.q_network(state_tensor)
-                return torch.argmax(action_values.squeeze(), dim=1).cpu().tolist()
+                # Select best action for each actuator
+                actions = torch.argmax(action_values.squeeze(), dim=1).tolist()
+        
+        return actions
     
     def remember(self, state, actions, reward, next_state):
         """Store experience with multiple actions"""
@@ -222,11 +227,11 @@ class RobotDQNAgent:
         minibatch = random.sample(self.memory, self.batch_size)
         states, actions, rewards, next_states = zip(*minibatch)
         
-        # Convert to tensors and move to GPU
-        states = torch.FloatTensor(np.array(states)).to(device)
-        actions = torch.LongTensor(np.array(actions)).to(device)
-        rewards = torch.FloatTensor(rewards).to(device)
-        next_states = torch.FloatTensor(np.array(next_states)).to(device)
+        # Convert to tensors with validation
+        states = torch.FloatTensor(np.array(states))
+        actions = torch.LongTensor(np.array(actions))  # Shape: [batch_size, num_actuators]
+        rewards = torch.FloatTensor(rewards)
+        next_states = torch.FloatTensor(np.array(next_states))
         
         if torch.isnan(states).any() or torch.isnan(next_states).any():
             print("NaN detected in batch data!")
@@ -250,6 +255,8 @@ class RobotDQNAgent:
             
             if torch.isnan(loss):
                 print("NaN loss detected!")
+                print(f"States range: {states.min().item():.2f} to {states.max().item():.2f}")
+                print(f"Rewards range: {rewards.min().item():.2f} to {rewards.max().item():.2f}")
                 return
             
             # Optimize
@@ -397,12 +404,12 @@ def save_model(agent, output_dir, model_name="robot_dqn_model"):
     """
     # Ensure directory exists
     os.makedirs(output_dir, exist_ok=True)
+    
+    # Construct the path where the model will be saved
     model_path = os.path.join(output_dir, f"{model_name}.pth")
-    # Move model to CPU before saving
-    agent.q_network.cpu()
+    
+    # Save the model state dictionary
     torch.save(agent.q_network.state_dict(), model_path)
-    # Move model back to original device
-    agent.q_network.to(device)
     print(f"Model saved to {model_path}")
 
 def train_robot(rob, active_sensor_idx=0, num_episodes=100, historical_window=5, target_sensor_weight=0.5, output_dir='output'):
@@ -483,29 +490,33 @@ def train_robot(rob, active_sensor_idx=0, num_episodes=100, historical_window=5,
     
     return agent, metrics
 
-time_start = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+def main():
+    time_start = datetime.now().strftime("%Y-%m-%d-%H%M%S")
 
-# output dir 
-output_dir = 'output'
-# Ensure directory exists
-os.makedirs(output_dir, exist_ok=True)
+    # output dir 
+    output_dir = 'output'
+    # Ensure directory exists
+    os.makedirs(output_dir, exist_ok=True)
 
-historical_window = 10 # how many readings back are we subtracting from 
-target_sensor_weight = 0.75 # ratio of how much we consider current sensor progress vs considering no change in other sensors 
-num_episodes = 200
-active_sensor_idx = 0  # Change this to use different sensors
+    historical_window = 15 # how many readings back are we subtracting from 
+    target_sensor_weight = 0.90 # ratio of how much we consider current sensor progress vs considering no change in other sensors 
+    num_episodes = 1200
+    active_sensor_idx = 0  # Change this to use different sensors
 
-run_output_dir = os.path.join(output_dir, f'{time_start}-{target_sensor_weight}-{historical_window}')
-os.makedirs(run_output_dir, exist_ok=True)
+    run_output_dir = os.path.join(output_dir, f'{time_start}-{target_sensor_weight}-{historical_window}')
+    os.makedirs(run_output_dir, exist_ok=True)
 
-# Train the robot
-rob = Rob()
-agent, metrics = train_robot(rob, active_sensor_idx=active_sensor_idx, num_episodes=num_episodes, target_sensor_weight=target_sensor_weight, historical_window=historical_window, output_dir=run_output_dir)
+    # Train the robot
+    rob = Rob()
+    agent, metrics = train_robot(rob, active_sensor_idx=active_sensor_idx, num_episodes=num_episodes, target_sensor_weight=target_sensor_weight, historical_window=historical_window, output_dir=run_output_dir)
 
-# save model 
-save_model(agent, run_output_dir)
+    # save model 
+    save_model(agent, run_output_dir)
 
-time_stop = datetime.now().strftime("%Y-%m-%d-%H%M%S")
+    time_stop = datetime.now().strftime("%Y-%m-%d-%H%M%S")
 
-print(f'Start time:{time_start}')
-print(f'Stop time:{time_stop}')
+    print(f'Start time:{time_start}')
+    print(f'Stop time:{time_stop}')
+
+if __name__ == "__main__":
+    main()
