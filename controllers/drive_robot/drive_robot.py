@@ -5,20 +5,30 @@ import torch.nn as nn
 import torch.optim as optim
 import random
 from collections import deque
-from robot_desc import Rob
+from robot_env import RobotEnv
 from datetime import datetime
 import os
+import pandas as pd
+
+# Set device
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+print(f"Using device: {device}")
 
 class QNetwork(nn.Module):
-    def __init__(self, state_size, actions_per_actuator, num_actuators):
+    def __init__(self, state_size, actions_per_actuator, num_actuators, sensor_history_size):
         super(QNetwork, self).__init__()
         self.state_size = state_size
         self.actions_per_actuator = actions_per_actuator
         self.num_actuators = num_actuators
+        self.sensor_history_size = sensor_history_size
         
-        # Shared layers
-        self.fc1 = nn.Linear(state_size, 128)
-        self.fc2 = nn.Linear(128, 128)
+        # Calculate total input size (actuator states + sensor history)
+        total_input_size = state_size + sensor_history_size
+        
+        # Shared layers with increased size to handle additional input
+        self.fc1 = nn.Linear(total_input_size, 256)
+        self.fc2 = nn.Linear(256, 256)
+        self.fc3 = nn.Linear(256, 128)
         
         # Separate output layers for each actuator
         self.output_layers = nn.ModuleList([
@@ -26,32 +36,46 @@ class QNetwork(nn.Module):
         ])
         
         # Initialize weights
-        for layer in [self.fc1, self.fc2] + list(self.output_layers):
+        for layer in [self.fc1, self.fc2, self.fc3] + list(self.output_layers):
             nn.init.xavier_uniform_(layer.weight)
             nn.init.zeros_(layer.bias)
+            
+        # Move model to GPU if available
+        self.to(device)
         
-    def forward(self, x):
-        if torch.isnan(x).any():
+    def forward(self, x, sensor_history):
+        if torch.isnan(x).any() or torch.isnan(sensor_history).any():
             print("NaN detected in input!")
             x = torch.nan_to_num(x, 0.0)
+            sensor_history = torch.nan_to_num(sensor_history, 0.0)
         
-        x = torch.clamp(x, -10, 10)
+        # Concatenate actuator state and sensor history
+        combined_input = torch.cat([x, sensor_history], dim=1)
+        combined_input = torch.clamp(combined_input, -10, 10)
         
-        # Shared features
-        x = torch.relu(self.fc1(x))
+        # Forward pass through shared layers
+        x = torch.relu(self.fc1(combined_input))
         x = torch.relu(self.fc2(x))
+        x = torch.relu(self.fc3(x))
         
         # Separate outputs for each actuator
         outputs = [layer(x) for layer in self.output_layers]
         return torch.stack(outputs, dim=1)
 
 class RobotDQNAgent:
-    def __init__(self, rob, state_size, actions_per_actuator, active_sensor_idx=0, historical_window=5, target_sensor_weight=0.5):
+    def __init__(self, rob, state_size, actions_per_actuator, active_sensor_idx=0, 
+                 historical_window=5, target_sensor_weight=0.5, sensor_history_size=10):
         self.rob = rob
         self.state_size = state_size
         self.num_actuators = len(rob.get_actuators())
         self.actions_per_actuator = actions_per_actuator
         self.active_sensor_idx = active_sensor_idx
+        self.sensor_history_size = sensor_history_size
+        
+        # Initialize sensor history buffer for neural network input
+        self.nn_sensor_history = deque(maxlen=sensor_history_size)
+        # Fill history with zeros initially
+        self.nn_sensor_history.extend([0.0] * sensor_history_size)
         
         # Validate sensor index
         num_sensors = len(rob.get_sensors())
@@ -70,136 +94,34 @@ class RobotDQNAgent:
 
         # Reward structure
         self.target_sensor_weight = target_sensor_weight
-
         self.steps_per_episode = 1000
         
-        # Track histories for all sensors
+        # Track histories for reward calculation
         self.historical_window = historical_window
-        self.reading_history = deque(maxlen=10)  # For active sensor potential calculation
+        self.reading_history = deque(maxlen=10)
         self.sensor_histories = {i: deque(maxlen=100) for i in range(num_sensors)}
         self.sensor_stats = {i: {'min': None, 'max': None, 'mean': None, 'std': None} 
                            for i in range(num_sensors)}
         self.baseline_reading = None
         self.potential_scale = 0.5
         
-        # Initialize networks
-        self.q_network = QNetwork(state_size, actions_per_actuator, self.num_actuators)
-        self.target_network = QNetwork(state_size, actions_per_actuator, self.num_actuators)
+        # Initialize networks with sensor history size
+        self.q_network = QNetwork(state_size, actions_per_actuator, self.num_actuators, sensor_history_size)
+        self.target_network = QNetwork(state_size, actions_per_actuator, self.num_actuators, sensor_history_size)
         self.target_network.load_state_dict(self.q_network.state_dict())
         
         self.optimizer = optim.Adam(self.q_network.parameters(), lr=self.learning_rate)
         self.action_space = np.linspace(-1, 1, actions_per_actuator)
-
-    def get_state(self):
-        """Get current state (actuator positions) with validation"""
-        state = np.array([act.get_position() for act in self.rob.get_actuators()])
-        
-        # Check for invalid values
-        if np.isnan(state).any():
-            print("Warning: NaN detected in state!")
-            state = np.nan_to_num(state, 0.0)
-        
-        # Normalize state values
-        state = np.clip(state, -10, 10)
-        return state
-    
-    def get_reward_with_metrics(self, initial_readings, final_readings):
-        """Calculate reward and return metrics data"""
-        # Normalize readings
-        target_initial = self.normalize_reading(self.active_sensor_idx, initial_readings[self.active_sensor_idx])
-        target_final = self.normalize_reading(self.active_sensor_idx, final_readings[self.active_sensor_idx])
-        
-        # Calculate historical difference
-        historical_window = self.historical_window
-        if len(self.reading_history) >= historical_window:
-            historical_diff = target_final - self.reading_history[-historical_window]
-        else:
-            historical_diff = target_final - target_initial
-
-        # Calculate stability penalty and normalize other sensors
-        stability_penalty = 0
-        normalized_others = {}
-        num_other_sensors = len(initial_readings) - 1  # Exclude the active sensor
-
-        for i, (init_reading, final_reading) in enumerate(zip(initial_readings, final_readings)):
-            if i != self.active_sensor_idx:
-                init_norm = self.normalize_reading(i, init_reading)
-                final_norm = self.normalize_reading(i, final_reading)
-                normalized_others[i] = final_norm
-                stability_penalty += abs(final_norm - init_norm)
- 
-        # Average the stability penalty per sensor
-        if num_other_sensors > 0:
-            stability_penalty /= num_other_sensors
-        
-        # Calculate final reward
-        sensor_weight = self.target_sensor_weight
-        stability_weight = 1 - self.target_sensor_weight
-        reward = (sensor_weight * historical_diff - 
-                stability_weight * stability_penalty)
-
-        # Update history
-        self.reading_history.append(target_final)
-    
-        # Return reward and metrics
-        metrics_data = {
-            'normalized_target': target_final,
-            'historical_diff': historical_diff,
-            'stability_penalty': stability_penalty,
-            'normalized_others': normalized_others
-        }
-
-        return np.clip(reward, -10, 10), metrics_data
-
-    def update_sensor_stats(self, sensor_idx, reading):
-        """Update running statistics for sensor normalization"""
-        history = self.sensor_histories[sensor_idx]
-        history.append(reading)
-        
-        if len(history) >= 10:  # Wait for some history to accumulate
-            stats = self.sensor_stats[sensor_idx]
-            readings_array = np.array(history)
-            stats['min'] = np.min(readings_array)
-            stats['max'] = np.max(readings_array)
-            stats['mean'] = np.mean(readings_array)
-            stats['std'] = np.std(readings_array) if len(history) > 1 else 1.0
-    
-    def get_all_sensor_readings(self):
-        """Get readings from all sensors"""
-        try:
-            readings = []
-            for i, sensor in enumerate(self.rob.get_sensors()):
-                reading = sensor.get_reading()
-                if np.isnan(reading):
-                    print(f"Warning: NaN reading from sensor {i}")
-                    reading = 0.0
-                readings.append(reading)
-                self.update_sensor_stats(i, reading)
-            return readings
-        except Exception as e:
-            print(f"Error reading sensors: {e}")
-            return [0.0] * len(self.rob.get_sensors())
    
-    def normalize_reading(self, sensor_idx, reading):
-        """Normalize sensor reading based on historical statistics"""
-        stats = self.sensor_stats[sensor_idx]
-        
-        # If we don't have enough history, use the current reading
-        # to create initial statistics
-        if stats['mean'] is None:
-            stats['mean'] = reading
-            stats['std'] = 1.0  # Use a default standard deviation
-            stats['min'] = reading
-            stats['max'] = reading
-        
-        # Z-score normalization with clipping
-        if stats['std'] > 0:
-            normalized = (reading - stats['mean']) / stats['std']
-        else:
-            normalized = reading - stats['mean']
-            
-        return np.clip(normalized, -3, 3)  # Clip to 3 standard deviations
+
+    def update_sensor_history(self, sensor_reading):
+        """Update the neural network's sensor history buffer"""
+        self.nn_sensor_history.append(sensor_reading)
     
+    def get_sensor_history_tensor(self):
+        """Convert sensor history to tensor for neural network input"""
+        return torch.FloatTensor(list(self.nn_sensor_history))
+  
     def act(self, state):
         """Choose an action using epsilon-greedy policy"""
         if random.random() < self.epsilon:
@@ -208,16 +130,17 @@ class RobotDQNAgent:
                       for _ in range(self.num_actuators)]
         else:
             with torch.no_grad():
-                state_tensor = torch.FloatTensor(state).unsqueeze(0)
-                action_values = self.q_network(state_tensor)
+                state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                sensor_history_tensor = torch.FloatTensor(list(self.nn_sensor_history)).unsqueeze(0).to(device)
+                action_values = self.q_network(state_tensor, sensor_history_tensor)
                 # Select best action for each actuator
-                actions = torch.argmax(action_values.squeeze(), dim=1).tolist()
+                actions = action_values.squeeze().cpu().argmax(dim=1).tolist()
         
         return actions
     
-    def remember(self, state, actions, reward, next_state):
-        """Store experience with multiple actions"""
-        self.memory.append((state, actions, reward, next_state))
+    def remember(self, state, sensor_history, actions, reward, next_state, next_sensor_history):
+        """Store experience with multiple actions and sensor history"""
+        self.memory.append((state, sensor_history, actions, reward, next_state, next_sensor_history))
     
     def replay(self):
         """Experience replay with multiple actions"""
@@ -225,29 +148,31 @@ class RobotDQNAgent:
             return
         
         minibatch = random.sample(self.memory, self.batch_size)
-        states, actions, rewards, next_states = zip(*minibatch)
+        states, sensor_histories, actions, rewards, next_states, next_sensor_histories = zip(*minibatch)
         
-        # Convert to tensors with validation
-        states = torch.FloatTensor(np.array(states))
-        actions = torch.LongTensor(np.array(actions))  # Shape: [batch_size, num_actuators]
-        rewards = torch.FloatTensor(rewards)
-        next_states = torch.FloatTensor(np.array(next_states))
+        # Convert to tensors and move to GPU
+        states = torch.FloatTensor(np.array(states)).to(device)
+        sensor_histories = torch.FloatTensor(np.array(sensor_histories)).to(device)
+        actions = torch.LongTensor(np.array(actions)).to(device)
+        rewards = torch.FloatTensor(rewards).to(device)
+        next_states = torch.FloatTensor(np.array(next_states)).to(device)
+        next_sensor_histories = torch.FloatTensor(np.array(next_sensor_histories)).to(device)
         
-        if torch.isnan(states).any() or torch.isnan(next_states).any():
+        if torch.isnan(states).any() or torch.isnan(sensor_histories).any():
             print("NaN detected in batch data!")
             return
         
         try:
             # Current Q values for each actuator
-            current_q_all = self.q_network(states)
+            current_q_all = self.q_network(states, sensor_histories)
             current_q = torch.gather(current_q_all, 2, actions.unsqueeze(2)).squeeze(2)
             
             # Next Q values
             with torch.no_grad():
-                next_q_all = self.target_network(next_states)
+                next_q_all = self.target_network(next_states, next_sensor_histories)
                 next_q = next_q_all.max(2)[0]
             
-            # Target Q values (same reward applied to all actuators)
+            # Target Q values
             target_q = rewards.unsqueeze(1) + self.gamma * next_q
             
             # Compute loss across all actuators
@@ -255,8 +180,6 @@ class RobotDQNAgent:
             
             if torch.isnan(loss):
                 print("NaN loss detected!")
-                print(f"States range: {states.min().item():.2f} to {states.max().item():.2f}")
-                print(f"Rewards range: {rewards.min().item():.2f} to {rewards.max().item():.2f}")
                 return
             
             # Optimize
@@ -277,52 +200,8 @@ class RobotDQNAgent:
     def update_target_network(self):
         """Update target network periodically"""
         self.target_network.load_state_dict(self.q_network.state_dict())
-    
-    def train_episode(self, max_steps=1000):
-        """Training episode with focus on active sensor"""
-        total_reward = 0
-        state = self.get_state()
-        episode_readings = []
-        self.action_history = []
-        
-        for step in range(max_steps):
-            initial_readings = self.get_all_sensor_readings()
-            actions = self.act(state)
-            self.action_history.append(actions)
-            
-            # Apply actions to actuators
-            for actuator, action_idx in zip(self.rob.get_actuators(), actions):
-                motor_intensity = self.action_space[action_idx]
-                actuator.apply_intensity(motor_intensity * actuator.max_speed)
-            
-            # Run simulation with smaller steps for stability
-            for _ in range(100):
-                self.rob.step()
-            
-            # Get new state and calculate reward
-            next_state = self.get_state()
-            final_readings = self.get_all_sensor_readings()
-            reward = self.get_reward(initial_readings, final_readings)
-            
-            # Store experience and train
-            self.remember(state, actions, reward, next_state)
-            self.replay()
-            
-            total_reward += reward
-            state = next_state
-            episode_readings.append(final_readings[self.active_sensor_idx])
-            
-            if step % 100 == 0:
-                self.update_target_network()
-                active_reading = final_readings[self.active_sensor_idx]
-                stability_penalty = sum(abs(self.normalize_reading(i, r)) 
-                                     for i, r in enumerate(final_readings) 
-                                     if i != self.active_sensor_idx)
-                print(f"Step {step}, Active Sensor ({self.active_sensor_idx}) Reading: {active_reading:.3f}, "
-                      f"Reward: {reward:.3f}, Stability Penalty: {stability_penalty:.3f}")
-        
-        return total_reward, episode_readings
 
+    
 class TrainingMetrics:
     def __init__(self):
         # Initialize lists to store metrics
@@ -395,72 +274,65 @@ class TrainingMetrics:
         print(f"Saved all metrics to {csv_file}")
 
 def save_model(agent, output_dir, model_name="robot_dqn_model"):
-    """
-    Save the Q-network of the agent to the specified directory.
-
-    :param agent: RobotDQNAgent instance
-    :param output_dir: Directory where to save the model
-    :param model_name: Name to give the saved model file
-    """
-    # Ensure directory exists
+    """Save the Q-network of the agent to the specified directory."""
     os.makedirs(output_dir, exist_ok=True)
-    
-    # Construct the path where the model will be saved
     model_path = os.path.join(output_dir, f"{model_name}.pth")
-    
-    # Save the model state dictionary
-    torch.save(agent.q_network.state_dict(), model_path)
+    # Move model to CPU before saving
+    model_state = {k: v.cpu() for k, v in agent.q_network.state_dict().items()}
+    torch.save(model_state, model_path)
     print(f"Model saved to {model_path}")
 
-def train_robot(rob, active_sensor_idx=0, num_episodes=100, historical_window=5, target_sensor_weight=0.5, output_dir='output'):
-    rob.setup()
-    state_size = len(rob.get_actuators())
-    actions_per_actuator = 2  # Number of discrete actions per actuator
-    
-    agent = RobotDQNAgent(rob, state_size, actions_per_actuator, active_sensor_idx, historical_window=historical_window, target_sensor_weight=target_sensor_weight)
+# Rest of the code remains the same...
+def train_robot(env, num_episodes=100, output_dir='output'):
+    agent = RobotDQNAgent(rob=env.rob, state_size=env.num_actuators, 
+                         actions_per_actuator=len(env.action_space), 
+                         active_sensor_idx=env.active_sensor_idx, 
+                         historical_window=env.historical_window, 
+                         target_sensor_weight=env.target_sensor_weight,
+                         sensor_history_size=10)  
     metrics = TrainingMetrics()
     timestamp = datetime.now().strftime("%Y-%m-%d-%H%M%S")
     
     for episode in range(num_episodes):
+        state = env.reset()
         total_reward = 0
-        state = agent.get_state()
         
-        for step in range(agent.steps_per_episode):  # max steps per episode
-            initial_readings = agent.get_all_sensor_readings()
+        for step in range(agent.steps_per_episode):
+            # Get current sensor reading and update history
+            current_sensor = env.get_all_sensor_readings()[env.active_sensor_idx]
+            agent.update_sensor_history(current_sensor)
+            
+            # Get actions using current state and sensor history
             actions = agent.act(state)
+            next_state, reward, done, metrics_data = env.step(actions)
             
-            # Apply actions to actuators
-            for actuator, action_idx in zip(rob.get_actuators(), actions):
-                motor_intensity = agent.action_space[action_idx]
-                actuator.apply_intensity(motor_intensity * actuator.max_speed)
+            # Update sensor history with new reading
+            next_sensor = env.get_all_sensor_readings()[env.active_sensor_idx]
+            agent.update_sensor_history(next_sensor)
             
-            # Run simulation steps
-            for _ in range(100):
-                rob.step()
+            # Store experience with sensor histories
+            agent.remember(state, 
+                         list(agent.nn_sensor_history),
+                         actions, 
+                         reward, 
+                         next_state,
+                         list(agent.nn_sensor_history))
             
-            # Get new state and readings
-            next_state = agent.get_state()
-            final_readings = agent.get_all_sensor_readings()
-            
-            # Calculate reward and update metrics
-            reward, metrics_data = agent.get_reward_with_metrics(initial_readings, final_readings)
-            
-            # Update metrics
+            # Update metrics with raw reading instead of normalized
             metrics.update(
                 episode=episode,
                 step=step,
-                raw_reading=final_readings[active_sensor_idx],
+                raw_reading=metrics_data['raw_target'],  # Changed from normalized_target to raw_target
                 norm_reading=metrics_data['normalized_target'],
                 stability=metrics_data['stability_penalty'],
                 hist_diff=metrics_data['historical_diff'],
-                raw_others={i: r for i, r in enumerate(final_readings) if i != active_sensor_idx},
+                raw_others={i: metrics_data['raw_others'][i] for i in metrics_data['raw_others']},  # Changed to use raw_others
                 norm_others=metrics_data['normalized_others'],
                 reward=reward,
                 epsilon=agent.epsilon
             )
             
-            # Store experience and train
-            agent.remember(state, actions, reward, next_state)
+            # Train the network
             agent.replay()
             
             total_reward += reward
@@ -468,49 +340,43 @@ def train_robot(rob, active_sensor_idx=0, num_episodes=100, historical_window=5,
             
             if step % 100 == 0:
                 agent.update_target_network()
-                print(f"Episode {episode + 1}, Step {step}",
-                    f"  Raw Reading: {final_readings[active_sensor_idx]:.3f}", 
-                    f"  Normalized Reading: {metrics_data['normalized_target']:.3f}",
-                    f"  Stability Penalty: {metrics_data['stability_penalty']:.3f}",
-                    f"  Historical Difference: {metrics_data['historical_diff']:.3f}",
-                    f"  Reward: {reward:.3f}"
+                print(f"Episode {episode + 1}, Step {step}", 
+                      f"  Raw Reading: {metrics_data['raw_target']:.3f}",  # Updated to show raw reading
+                      f"  Stability Penalty: {metrics_data['stability_penalty']:.3f}",
+                      f"  Historical Difference: {metrics_data['historical_diff']:.3f}",
+                      f"  Reward: {reward:.3f}"
                 )
         
-        # End of episode
         metrics.end_episode(episode, total_reward)
-        
-        # Print episode summary
         print(f"\nEpisode {episode + 1}/{num_episodes} Complete")
         print(f"Total Reward: {total_reward:.2f}")
         print(f"Epsilon: {agent.epsilon:.2f}")
         print("-" * 50)
     
-    # Save all metrics
     metrics.save_metrics(output_dir, timestamp)
-    
     return agent, metrics
 
 def main():
     time_start = datetime.now().strftime("%Y-%m-%d-%H%M%S")
 
-    # output dir 
     output_dir = 'output'
-    # Ensure directory exists
     os.makedirs(output_dir, exist_ok=True)
 
-    historical_window = 15 # how many readings back are we subtracting from 
-    target_sensor_weight = 0.90 # ratio of how much we consider current sensor progress vs considering no change in other sensors 
-    num_episodes = 1200
-    active_sensor_idx = 0  # Change this to use different sensors
+    historical_window = 15 
+    target_sensor_weight = 1.0
+    num_episodes = 2000
+    active_sensor_idx = 0  
 
     run_output_dir = os.path.join(output_dir, f'{time_start}-{target_sensor_weight}-{historical_window}')
     os.makedirs(run_output_dir, exist_ok=True)
 
+    # Initialize environment
+    env = RobotEnv(active_sensor_idx=active_sensor_idx, historical_window=historical_window, target_sensor_weight=target_sensor_weight)
+    
     # Train the robot
-    rob = Rob()
-    agent, metrics = train_robot(rob, active_sensor_idx=active_sensor_idx, num_episodes=num_episodes, target_sensor_weight=target_sensor_weight, historical_window=historical_window, output_dir=run_output_dir)
+    agent, _ = train_robot(env, num_episodes=num_episodes, output_dir=run_output_dir)
 
-    # save model 
+    # Save model 
     save_model(agent, run_output_dir)
 
     time_stop = datetime.now().strftime("%Y-%m-%d-%H%M%S")
